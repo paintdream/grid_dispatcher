@@ -33,10 +33,8 @@ SOFTWARE.
 #include <functional>
 #include <thread>
 #include <vector>
-#include <mutex>
 #include <atomic>
 #include <cassert>
-// #include <iostream>
 
 namespace grid {
 	// simple kfifo like queue. allowing one-thread read (pop) and one-thread write (push).
@@ -106,16 +104,16 @@ namespace grid {
 			node* next; // chain next queue
 		};
 
-	protected:
-		node* push_head = nullptr;
-		node* pop_head = nullptr; // pop_head is always prior to push_head.
-
 	public:
+		// do not copy this class, only to move
+		queue_list_t(const queue_list_t& rhs) = delete;
+		queue_list_t& operator = (const queue_list_t& rhs) = delete;
+
 		queue_list_t() {
 			push_head = pop_head = new node();
 		}
 
-		queue_list_t(queue_list_t&& rhs) {
+		queue_list_t(queue_list_t&& rhs) noexcept {
 			push_head = rhs.push_head;
 			pop_head = rhs.pop_head;
 
@@ -188,268 +186,122 @@ namespace grid {
 
 			return counter;
 		}
+
+	protected:
+		node* push_head = nullptr;
+		node* pop_head = nullptr; // pop_head is always prior to push_head.
 	};
 
-	// grid dispatcher, dispatch routines:
-	//     1. from warp to warp. (dispatcher_t::queue_routine/queue_routine_post).
-	//     2. from external thread to warp (dispatcher_t::queue_routine_external).
-	//     3. from warp to external in parallel (dispathcer_t::queue_routine_parallel).
-	template <typename async_worker_t, size_t K = 10>
-	class dispatcher_t {
-	protected:
-		// task queue collection for a specified destination warp from all source threads.
-		class task_queue_t {
-		public:
-			using queue_buffer = queue_list_t<std::function<void(size_t)>, K>;
+	// dispatch routines:
+	//     1. from warp to warp. (queue_routine/queue_routine_post).
+	//     2. from external thread to warp (queue_routine_external).
+	//     3. from warp to external in parallel (queue_routine_parallel).
+	template <typename async_worker_t, size_t K = 6>
+	class warp_t {
+	public:
+		using queue_buffer = queue_list_t<std::function<void()>, K>;
 
-			task_queue_t(dispatcher_t& host_, size_t thread_count) : host(host_) {
-				queue_buffers.resize(thread_count);
-				thread_warp.store(nullptr, std::memory_order_relaxed);
-				suspend_count.store(0, std::memory_order_relaxed);
-				queueing.store(0, std::memory_order_release);
+		// do not copy this class, only to move
+		warp_t(const warp_t& rhs) = delete;
+		warp_t& operator = (const warp_t& rhs) = delete;
+
+		warp_t(async_worker_t& worker, size_t thread_count) : async_worker(worker) {
+			queue_buffers.resize(thread_count);
+			thread_warp.store(nullptr, std::memory_order_relaxed);
+			suspend_count.store(0, std::memory_order_relaxed);
+			queueing.store(0, std::memory_order_release);
+		}
+
+		warp_t(warp_t&& rhs) noexcept : async_worker(rhs.async_worker) {
+			queue_buffers = std::move(rhs.queue_buffers);
+			thread_warp.store(rhs.thread_warp.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			suspend_count.store(rhs.suspend_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			queueing.store(rhs.queueing.load(std::memory_order_relaxed), std::memory_order_relaxed);
+			rhs.thread_warp.store(nullptr, std::memory_order_relaxed);
+			rhs.suspend_count.store(0, std::memory_order_relaxed);
+			rhs.queueing.store(0, std::memory_order_release);
+		}
+
+		// take execution atomically, returns true on success.
+		bool preempt() {
+			warp_t** expected = nullptr;
+			if (thread_warp.compare_exchange_strong(expected, &get_current_warp_internal(), std::memory_order_acq_rel)) {
+				get_current_warp_internal() = this;
+				return true;
+			} else {
+				return get_current_warp_internal() == this;
 			}
+		}
 
-			task_queue_t(task_queue_t&& rhs) : host(rhs.host) {
-				queue_buffers = std::move(rhs.queue_buffers);
-				thread_warp.store(rhs.thread_warp.load(std::memory_order_relaxed), std::memory_order_relaxed);
-				suspend_count.store(rhs.suspend_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
-				queueing.store(rhs.queueing.load(std::memory_order_relaxed), std::memory_order_relaxed);
-				rhs.thread_warp.store(nullptr, std::memory_order_relaxed);
-				rhs.suspend_count.store(0, std::memory_order_relaxed);
-				rhs.queueing.store(0, std::memory_order_release);
-			}
-
-			// do not copy this class, only to move
-			task_queue_t(const task_queue_t& rhs) = delete;
-			task_queue_t& operator = (const task_queue_t& rhs) = delete;
-
-			// take execution atomically, returns true on success.
-			bool preempt_execution() {
-				size_t* expected = nullptr;
-				size_t this_warp_index = this - &host.task_queue_grids[0];
-				if (thread_warp.compare_exchange_strong(expected, &get_current_warp_index(), std::memory_order_acq_rel)) {
-					get_current_warp_index() = this_warp_index;
-					return true;
-				} else {
-					return expected == &get_current_warp_index();
-				}
-			}
-
-			// yield execution atomically, returns true on success.
-			bool yield_execution() {
-				size_t* exp = &get_current_warp_index();
-				if (thread_warp.compare_exchange_strong(exp, nullptr, std::memory_order_release)) {
-					get_current_warp_index() = ~(size_t)0;
-					if (queueing.exchange(0, std::memory_order_relaxed) == 1) {
-						flush();
-					}
-
-					return true;
-				} else {
-					return false;
-				}
-			}
-
-			// execute all tasks scheduled at once.
-			void execute() {
-				if (suspend_count.load(std::memory_order_acquire) == 0) {
-					// try to acquire execution, if it fails, there must be another thread doing the same thing
-					// and it's ok to return immediatly.
-					if (preempt_execution()) {
-						// mark for queueing, avoiding flush me more than once.
-						queueing.store(2, std::memory_order_relaxed);
-						size_t warp_index = this - &host.task_queue_grids[0];
-
-						/*
-						static std::mutex mutex;
-						{
-							std::lock_guard<std::mutex> g(mutex);
-							std::cout << "thread " << host.async_worker.get_current_thread_index() << " takes " << warp_index << std::endl;
-						}*/
-
-						for (size_t i = 0; i < queue_buffers.size(); i++) {
-							queue_buffer& buffer = queue_buffers[i];
-							while (!buffer.empty()) {
-								buffer.top()(warp_index);
-								buffer.pop();
-
-								if (suspend_count.load(std::memory_order_acquire) != 0
-									|| thread_warp.load(std::memory_order_relaxed) != &get_current_warp_index()
-									|| get_current_warp_index() != warp_index) {
-									i = queue_buffers.size();
-									break;
-								}
-							}
-						}
-
-						/*
-						{
-							std::lock_guard<std::mutex> g(mutex);
-							std::cout << "thread " << host.async_worker.get_current_thread_index() << " leaves " << warp_index << std::endl;
-						}*/
-
-						if (!yield_execution()) {
-							// already yielded? try to repost me to process remaining tasks.
-							flush();
-						} // otherwise all tasks are executed, safe to exit.
-					}
-				}
-			}
-
-			// blocks all tasks preemptions, stacked with internally counting.
-			void suspend() {
-				suspend_count.fetch_add(1, std::memory_order_acquire);
-			}
-
-			// allows all tasks preemptions, stacked with internally counting.
-			// returns true on final resume.
-			bool resume() {
-				bool ret = suspend_count.fetch_sub(1, std::memory_order_release) == 1;
-
-				if (ret) {
-					// all suspend requests removed, try to flush me
-					queueing.store(0, std::memory_order_relaxed);
+		// yield execution atomically, returns true on success.
+		bool yield() {
+			warp_t** exp = &get_current_warp_internal();
+			if (thread_warp.compare_exchange_strong(exp, nullptr, std::memory_order_release)) {
+				get_current_warp_internal() = nullptr;
+				if (queueing.exchange(0, std::memory_order_relaxed) == 1) {
 					flush();
 				}
 
-				return ret;
+				return true;
+			} else {
+				return false;
 			}
+		}
 
-			// commit execute request to specified thread pool.
-			void flush() {
-				if (queueing.exchange(1, std::memory_order_relaxed) == 0) {
-					host.async_worker.queue(std::bind(&task_queue_t::execute, this));
-				}
-			}
+		// blocks all tasks preemptions, stacked with internally counting.
+		void suspend() {
+			suspend_count.fetch_add(1, std::memory_order_acquire);
+		}
 
-			// queue task from specified thread.
-			template <typename F>
-			void push(size_t thread_index, F&& func) {
-				assert(thread_index < queue_buffers.size());
-				queue_buffer& buffer = queue_buffers[thread_index];
-				buffer.push(std::forward<F>(func));
+		// allows all tasks preemptions, stacked with internally counting.
+		// returns true on final resume.
+		bool resume() {
+			bool ret = suspend_count.fetch_sub(1, std::memory_order_release) == 1;
 
+			if (ret) {
+				// all suspend requests removed, try to flush me
+				queueing.store(0, std::memory_order_relaxed);
 				flush();
 			}
 
-		protected:
-			friend class dispatcher_t;
-
-			dispatcher_t& host;
-			std::atomic<size_t*> thread_warp; // save the running thread warp address.
-			std::atomic<size_t> suspend_count;
-			std::atomic<size_t> queueing; // is flush request sent to async_worker? 0 : not yet, 1 : yes, 2 : is to flush right away.
-			std::vector<queue_buffer> queue_buffers; // task queues, each thread send tasks to its own slot of queue_buffers.
-		};
-
-	public:
-		dispatcher_t(async_worker_t& async_worker_, size_t warp_count) : async_worker(async_worker_) {
-			task_queue_grids.reserve(warp_count);
-			size_t thread_count = async_worker.get_thread_count();
-
-			// make grids with warp_count lines by thread_count columns
-			for (size_t i = 0; i < warp_count; i++) {
-				task_queue_grids.emplace_back(*this, thread_count);
-			}
+			return ret;
 		}
 
-		~dispatcher_t() { clear(); }
-
-		// get current warp index (saved in thread_local storage)
-		static size_t& get_current_warp_index() {
-			static thread_local size_t current_warp_index = ~(size_t)0;
-			return current_warp_index;
-		}
-
-		// yield current running warp, it indicates that you are detached from the current warp,
-		//     after yield, the detached warp could be taken by another thread to run the remaining tasks.
-		// you can only call this function within a attached(preempted) warp.
-		void yield_current_warp() {
-			assert(get_current_warp_index() != ~(size_t)0);
-			task_queue_grids[get_current_warp_index()].yield_execution();
-		}
-
-		// suspend current running warp, you can call it on any thread
-		void suspend_warp(size_t warp_index) {
-			task_queue_grids[warp_index].suspend();
-		}
-
-		// resume current running warp, you can call it on any thread
-		bool resume_warp(size_t warp_index) {
-			return task_queue_grids[warp_index].resume();
-		}
-
-		size_t get_warp_count() const { return task_queue_grids.size(); }
-
-		// clear the dispatcher, pass true to 'execute_remaining' to make sure all tasks are executed finally.
-		void clear(bool execute_remaining = false) {
-			// suspend all warps so we can take over tasks
-			for (size_t i = 0; i < get_warp_count(); i++) {
-				suspend_warp(i);
-			}
-
-			size_t thread_index = async_worker.get_current_thread_index();
-			thread_index = thread_index == ~(size_t)0 ? 0 : thread_index;
-
-			// do cleanup
-			for (size_t j = 0; j < get_warp_count(); j++) {
-				task_queue_t& q = task_queue_grids[j];
-
-				while (!q.preempt_execution()) {
-					std::this_thread::yield();
-				}
-		
-				// execute remaining
-				if (execute_remaining) {
-					q.execute();
-				}
-
-				q.yield_execution();
-			}
-
-			// resume warps
-			for (size_t k = 0; k < get_warp_count(); k++) {
-				resume_warp(k);
-			}
-		}
-
-		// send task to warp indicated by warp_index. call it directly if we are on warp_index.
+		// send task to this warp. call it directly if we are on warp.
 		template <typename F>
-		void queue_routine(size_t warp_index, F&& func) {
+		void queue_routine(F&& func) {
 			size_t thread_index = async_worker.get_current_thread_index();
 			assert(thread_index != ~(size_t)0);
-			assert(get_current_warp_index() != ~(size_t)0);
-			task_queue_t& q = task_queue_grids[warp_index];
+			assert(get_current_warp_internal() != nullptr);
 
 			// can be executed immediately?
-			if (get_current_warp_index() == warp_index
-				&& q.thread_warp.load(std::memory_order_relaxed) == &get_current_warp_index()
-				&& q.suspend_count.load(std::memory_order_acquire) == 0) {
-				func(warp_index);
+			if (get_current_warp_internal() == this
+				&& thread_warp.load(std::memory_order_relaxed) == &get_current_warp_internal()
+				&& suspend_count.load(std::memory_order_acquire) == 0) {
+				func();
 			} else {
 				// send to current thread slot of current warp.
-				q.push(thread_index, std::forward<F>(func));
+				push(thread_index, std::forward<F>(func));
 			}
 		}
 
-		// send task to warp indicated by warp_index. always post it to queue.
+		// send task to warp indicated by warp. always post it to queue.
 		template <typename F>
-		void queue_routine_post(size_t warp_index, F&& func) {
+		void queue_routine_post(F&& func) {
 			size_t thread_index = async_worker.get_current_thread_index();
 			assert(thread_index != ~(size_t)0);
-			task_queue_t& q = task_queue_grids[warp_index];
 
 			// always send to current thread slot of current warp.
-			q.push(thread_index, std::forward<F>(func));
+			push(thread_index, std::forward<F>(func));
 		}
 
 		// queue external routine from non-warp/yielded warp
 		template <typename F>
-		void queue_routine_external(size_t warp_index, F&& func) {
+		void queue_routine_external(F&& func) {
 			size_t thread_index = async_worker.get_current_thread_index();
 			assert(thread_index == ~(size_t)0);
-			async_worker.queue([this, warp_index, func = std::forward<F>(func)]() mutable {
-				queue_routine_post(warp_index, std::forward<F>(func));
+			async_worker.queue([this, func = std::forward<F>(func)]() mutable {
+				queue_routine_post(std::forward<F>(func));
 			});
 		}
 
@@ -457,19 +309,123 @@ namespace grid {
 		// it is useful to implement read-lock affairs
 		template <typename F>
 		void queue_routine_parallel(F&& func) {
-			size_t warp_index = get_current_warp_index();
-			assert(warp_index != ~(size_t)0);
-			suspend_warp(warp_index);
-			async_worker.queue([this, func = std::forward<F>(func), warp_index]() mutable {
-				get_current_warp_index() = warp_index; // force reset warp index
-				func(warp_index);
-				resume_warp(warp_index);
+			assert(get_current_warp_internal() == this);
+			suspend();
+			async_worker.queue([this, func = std::forward<F>(func)]() mutable {
+				get_current_warp_internal() = this; // force reset warp index
+				func();
+				resume();
 			});
 		}
 
+		// clear the dispatcher, pass true to 'execute_remaining' to make sure all tasks are executed finally.
+		template <bool execute_remaining = true, typename T = warp_t*>
+		static void join(T begin, T end) {
+			// suspend all warps so we can take over tasks
+			for (T p = begin; p != end; ++p) {
+				(*p).suspend();
+			}
+
+			// do cleanup
+			for (T p = begin; p != end; ++p) {
+				while (!(*p).preempt()) {
+					std::this_thread::yield();
+				}
+
+				// execute remaining
+				if (execute_remaining) {
+					(*p).execute();
+				}
+
+				(*p).yield();
+			}
+
+			// resume warps
+			for (T p = begin; p != end; ++p) {
+				(*p).resume();
+			}
+		}
+
+		static warp_t& get_current_warp() {
+			warp_t* ptr = get_current_warp_internal();
+			assert(ptr != nullptr);
+			return *ptr;
+		}
+
 	protected:
-		friend class task_queue_t;
+		// get current warp index (saved in thread_local storage)
+		static warp_t*& get_current_warp_internal() {
+			static thread_local warp_t* current_warp = nullptr;
+			return current_warp;
+		}
+
+		// execute all tasks scheduled at once.
+		void execute() {
+			if (suspend_count.load(std::memory_order_acquire) == 0) {
+				// try to acquire execution, if it fails, there must be another thread doing the same thing
+				// and it's ok to return immediatly.
+				if (preempt()) {
+					// mark for queueing, avoiding flush me more than once.
+					queueing.store(2, std::memory_order_relaxed);
+
+					/*
+					static std::mutex mutex;
+					{
+						std::lock_guard<std::mutex> g(mutex);
+						std::cout << "thread " << host.async_worker.get_current_thread_index() << " takes " << warp << std::endl;
+					}*/
+
+					for (size_t i = 0; i < queue_buffers.size(); i++) {
+						queue_buffer& buffer = queue_buffers[i];
+						while (!buffer.empty()) {
+							buffer.top()();
+							buffer.pop();
+
+							if (suspend_count.load(std::memory_order_acquire) != 0
+								|| thread_warp.load(std::memory_order_relaxed) != &get_current_warp_internal()
+								|| get_current_warp_internal() != this) {
+								i = queue_buffers.size();
+								break;
+							}
+						}
+					}
+
+					/*
+					{
+						std::lock_guard<std::mutex> g(mutex);
+						std::cout << "thread " << host.async_worker.get_current_thread_index() << " leaves " << warp << std::endl;
+					}*/
+
+					if (!yield()) {
+						// already yielded? try to repost me to process remaining tasks.
+						flush();
+					} // otherwise all tasks are executed, safe to exit.
+				}
+			}
+		}
+
+		// commit execute request to specified thread pool.
+		void flush() {
+			if (queueing.exchange(1, std::memory_order_relaxed) == 0) {
+				async_worker.queue(std::bind(&warp_t::execute, this));
+			}
+		}
+
+		// queue task from specified thread.
+		template <typename F>
+		void push(size_t thread_index, F&& func) {
+			assert(thread_index < queue_buffers.size());
+			queue_buffer& buffer = queue_buffers[thread_index];
+			buffer.push(std::forward<F>(func));
+
+			flush();
+		}
+
+	protected:
 		async_worker_t& async_worker;
-		std::vector<task_queue_t> task_queue_grids;
+		std::atomic<warp_t**> thread_warp; // save the running thread warp address.
+		std::atomic<size_t> suspend_count;
+		std::atomic<size_t> queueing; // is flush request sent to async_worker? 0 : not yet, 1 : yes, 2 : is to flush right away.
+		std::vector<queue_buffer> queue_buffers; // task queues, each thread send tasks to its own slot of queue_buffers.
 	};
 }

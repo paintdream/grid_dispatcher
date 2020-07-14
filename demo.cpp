@@ -93,14 +93,20 @@ int main(void) {
 	return 0;
 }
 
+typedef warp_t<demo_async_worker_t> demo_warp_t;
 
 void simple_explosion(void) {
 	static const size_t thread_count = 4;
 	static const size_t warp_count = 8;
-	demo_async_worker_t worker(thread_count);
-	dispatcher_t<demo_async_worker_t> dispatcher(worker, warp_count);
-	srand((unsigned int)time(nullptr));
 
+	demo_async_worker_t worker(thread_count);
+	std::vector<demo_warp_t> warps;
+	warps.reserve(warp_count);
+	for (size_t i = 0; i < warp_count; i++) {
+		warps.emplace_back(worker, thread_count);
+	}
+
+	srand((unsigned int)time(nullptr));
 	std::cout << "[[ demo for grid dispatcher : simple_explosion ]] " << std::endl;
 
 	static int32_t warp_data[warp_count] = { 0 };
@@ -109,11 +115,12 @@ void simple_explosion(void) {
 	static size_t parallel_factor = 11;
 	static size_t parallel_count = 6;
 
-	std::function<void(size_t)> explosion;
+	std::function<void()> explosion;
 
 	// queue tasks randomly to test if dispatcher could handle them correctly.
-	explosion = [&dispatcher, &explosion, &worker](size_t warp_index) {
-		assert(warp_index == dispatcher.get_current_warp_index());
+	explosion = [&warps, &explosion, &worker]() {
+		demo_warp_t& current_warp = demo_warp_t::get_current_warp();
+		size_t warp_index = &current_warp - &warps[0];
 		warp_data[warp_index]++;
 
 		// simulate working
@@ -128,7 +135,7 @@ void simple_explosion(void) {
 		warp_data[warp_index]++;
 		// randomly dispatch to warp
 		for (size_t i = 0; i < split_count; i++) {
-			dispatcher.queue_routine(rand() % warp_count, std::function<void(size_t)>(explosion));
+			warps[rand() % warp_count].queue_routine(std::function<void()>(explosion));
 		}
 
 		warp_data[warp_index] -= 3;
@@ -137,7 +144,7 @@ void simple_explosion(void) {
 			// read-write lock example: multiple reading blocks writing
 			std::shared_ptr<std::atomic<int32_t>> shared_value = std::make_shared<std::atomic<int32_t>>(-0x7fffffff);
 			for (size_t i = 0; i < parallel_count; i++) {
-				dispatcher.queue_routine_parallel([shared_value](size_t warp_index) {
+				current_warp.queue_routine_parallel([shared_value, warp_index]() {
 					// only read operations
 					std::this_thread::sleep_for(std::chrono::milliseconds(rand() % 40));
 					int32_t v = shared_value->exchange(warp_data[warp_index]);
@@ -149,11 +156,11 @@ void simple_explosion(void) {
 
 	worker.wait_for_ready();
 	// invoke explosion from external thread (current thread is external to the threads in thread pool)
-	dispatcher.queue_routine_external(0, std::function<void(size_t)>(explosion));
+	warps[0].queue_routine_external(std::function<void()>(explosion));
 	worker.join();
 
 	// finished!
-	dispatcher.clear(true);
+	demo_warp_t::join(warps.begin(), warps.end());
 
 	std::cout << "after: " << std::endl;
 	for (size_t k = 0; k < warp_count; k++) {
@@ -165,9 +172,13 @@ void garbage_collection() {
 	static const size_t thread_count = 8;
 	static const size_t warp_count = 16;
 	demo_async_worker_t worker(thread_count);
-	dispatcher_t<demo_async_worker_t> dispatcher(worker, warp_count);
-	srand((unsigned int)time(nullptr));
+	std::vector<demo_warp_t> warps;
+	warps.reserve(warp_count);
+	for (size_t i = 0; i < warp_count; i++) {
+		warps.emplace_back(worker, thread_count);
+	}
 
+	srand((unsigned int)time(nullptr));
 	std::cout << "[[ demo for grid dispatcher : garbage_collection ]] " << std::endl;
 	struct node_t {
 		size_t warp_index = 0;
@@ -205,11 +216,14 @@ void garbage_collection() {
 	size_t root_index = rand() % node_count;
 
 	// ok now let's start collect from root!
-	std::function<void(size_t, size_t)> collector;
+	std::function<void(size_t)> collector;
 	std::atomic<size_t> collecting_count;
 	collecting_count.store(0, std::memory_order_relaxed);
 
-	collector = [&dispatcher, &collector, &worker, &graph, &collecting_count](size_t node_index, size_t warp_index) {
+	collector = [&warps, &collector, &worker, &graph, &collecting_count](size_t node_index) {
+		demo_warp_t& current_warp = demo_warp_t::get_current_warp();
+		size_t warp_index = &current_warp - &warps[0];
+
 		node_t& node = graph.nodes[node_index];
 		assert(node.warp_index == warp_index);
 
@@ -220,7 +234,7 @@ void garbage_collection() {
 				size_t next_node_index = node.references[i];
 				size_t next_node_warp = graph.nodes[next_node_index].warp_index;
 				collecting_count.fetch_add(1, std::memory_order_acquire);
-				dispatcher.queue_routine(next_node_warp, std::bind(collector, next_node_index, std::placeholders::_1));
+				warps[next_node_warp].queue_routine(std::bind(collector, next_node_index));
 			}
 		}
 
@@ -247,9 +261,9 @@ void garbage_collection() {
 		graph.nodes[root_index].references.emplace_back(rand() % node_count);
 	}
 
-	dispatcher.queue_routine_external(graph.nodes[root_index].warp_index, std::bind(collector, root_index, std::placeholders::_1));
+	warps[graph.nodes[root_index].warp_index].queue_routine_external(std::bind(collector, root_index));
 	worker.join();
 
 	// finished!
-	dispatcher.clear(true);
+	demo_warp_t::join(warps.begin(), warps.end());
 }
