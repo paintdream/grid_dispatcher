@@ -34,6 +34,7 @@ SOFTWARE.
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <mutex>
 #include <cassert>
 
 namespace grid {
@@ -192,11 +193,33 @@ namespace grid {
 		node* pop_head = nullptr; // pop_head is always prior to push_head.
 	};
 
+	template <typename queue_buffer_t, bool>
+	struct storage_t {
+		storage_t() {}
+		storage_t(storage_t&& rhs) noexcept {
+			queue_buffer = std::move(rhs.queue_buffer);
+		}
+
+		storage_t& operator = (storage_t&& rhs) noexcept {
+			queue_buffer = std::move(rhs.queue_buffer);
+			return *this;
+		}
+
+		queue_buffer_t queue_buffer;
+		std::mutex mutex;
+	};
+
+	template <typename queue_buffer_t>
+	struct storage_t<queue_buffer_t, false> {
+		std::vector<queue_buffer_t> queue_buffers;
+	};
+
 	// dispatch routines:
 	//     1. from warp to warp. (queue_routine/queue_routine_post).
 	//     2. from external thread to warp (queue_routine_external).
 	//     3. from warp to external in parallel (queue_routine_parallel).
-	template <typename async_worker_t, size_t K = 6>
+	// you can select implemention from warp/strand via 'strand' template parameter.
+	template <typename async_worker_t, bool strand = false, size_t K = 6>
 	class warp_t {
 	public:
 		using queue_buffer = queue_list_t<std::function<void()>, K>;
@@ -205,15 +228,24 @@ namespace grid {
 		warp_t(const warp_t& rhs) = delete;
 		warp_t& operator = (const warp_t& rhs) = delete;
 
+		template <bool s>
+		typename std::enable_if<s>::type init_buffers(size_t thread_count) {}
+		template <bool s>
+		typename std::enable_if<!s>::type init_buffers(size_t thread_count) {
+			storage.queue_buffers.resize(thread_count);
+		}
+
 		warp_t(async_worker_t& worker, size_t thread_count) : async_worker(worker) {
-			queue_buffers.resize(thread_count);
+			init_buffers<strand>(thread_count);
+
 			thread_warp.store(nullptr, std::memory_order_relaxed);
 			suspend_count.store(0, std::memory_order_relaxed);
 			queueing.store(0, std::memory_order_release);
 		}
 
 		warp_t(warp_t&& rhs) noexcept : async_worker(rhs.async_worker) {
-			queue_buffers = std::move(rhs.queue_buffers);
+			storage = std::move(rhs.storage);
+
 			thread_warp.store(rhs.thread_warp.load(std::memory_order_relaxed), std::memory_order_relaxed);
 			suspend_count.store(rhs.suspend_count.load(std::memory_order_relaxed), std::memory_order_relaxed);
 			queueing.store(rhs.queueing.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -281,25 +313,21 @@ namespace grid {
 				func();
 			} else {
 				// send to current thread slot of current warp.
-				push(thread_index, std::forward<F>(func));
+				push<strand>(std::forward<F>(func));
 			}
 		}
 
 		// send task to warp indicated by warp. always post it to queue.
 		template <typename F>
 		void queue_routine_post(F&& func) {
-			size_t thread_index = async_worker.get_current_thread_index();
-			assert(thread_index != ~(size_t)0);
-
 			// always send to current thread slot of current warp.
-			push(thread_index, std::forward<F>(func));
+			push<strand>(std::forward<F>(func));
 		}
 
 		// queue external routine from non-warp/yielded warp
 		template <typename F>
 		void queue_routine_external(F&& func) {
-			size_t thread_index = async_worker.get_current_thread_index();
-			assert(thread_index == ~(size_t)0);
+			assert(async_worker.get_current_thread_index() == ~(size_t)0);
 			async_worker.queue([this, func = std::forward<F>(func)]() mutable {
 				queue_routine_post(std::forward<F>(func));
 			});
@@ -334,7 +362,7 @@ namespace grid {
 
 				// execute remaining
 				if (execute_remaining) {
-					(*p).execute();
+					(*p).template execute<strand>();
 				}
 
 				(*p).yield();
@@ -360,20 +388,41 @@ namespace grid {
 		}
 
 		// execute all tasks scheduled at once.
-		void execute() {
+		template <bool s>
+		typename std::enable_if<s>::type execute() {
+			if (suspend_count.load(std::memory_order_acquire) == 0) {
+				if (preempt()) {
+					// mark for queueing, avoiding flush me more than once.
+					queueing.store(2, std::memory_order_relaxed);
+					queue_buffer& buffer = storage.queue_buffer;
+					while (!buffer.empty()) {
+						buffer.top()();
+						buffer.pop();
+
+						if (suspend_count.load(std::memory_order_acquire) != 0
+							|| thread_warp.load(std::memory_order_relaxed) != &get_current_warp_internal()
+							|| get_current_warp_internal() != this) {
+							break;
+						}
+					}
+
+					if (!yield()) {
+						// already yielded? try to repost me to process remaining tasks.
+						flush();
+					}
+				}
+			}
+		}
+
+		template <bool s>
+		typename std::enable_if<!s>::type execute() {
 			if (suspend_count.load(std::memory_order_acquire) == 0) {
 				// try to acquire execution, if it fails, there must be another thread doing the same thing
 				// and it's ok to return immediatly.
 				if (preempt()) {
 					// mark for queueing, avoiding flush me more than once.
 					queueing.store(2, std::memory_order_relaxed);
-
-					/*
-					static std::mutex mutex;
-					{
-						std::lock_guard<std::mutex> g(mutex);
-						std::cout << "thread " << host.async_worker.get_current_thread_index() << " takes " << warp << std::endl;
-					}*/
+					std::vector<queue_buffer>& queue_buffers = storage.queue_buffers;
 
 					for (size_t i = 0; i < queue_buffers.size(); i++) {
 						queue_buffer& buffer = queue_buffers[i];
@@ -390,16 +439,12 @@ namespace grid {
 						}
 					}
 
-					/*
-					{
-						std::lock_guard<std::mutex> g(mutex);
-						std::cout << "thread " << host.async_worker.get_current_thread_index() << " leaves " << warp << std::endl;
-					}*/
-
 					if (!yield()) {
 						// already yielded? try to repost me to process remaining tasks.
 						flush();
-					} // otherwise all tasks are executed, safe to exit.
+					}
+					
+					// otherwise all tasks are executed, safe to exit.
 				}
 			}
 		}
@@ -407,13 +452,25 @@ namespace grid {
 		// commit execute request to specified thread pool.
 		void flush() {
 			if (queueing.exchange(1, std::memory_order_relaxed) == 0) {
-				async_worker.queue(std::bind(&warp_t::execute, this));
+				async_worker.queue(std::bind(&warp_t::template execute<strand>, this));
 			}
 		}
 
 		// queue task from specified thread.
-		template <typename F>
-		void push(size_t thread_index, F&& func) {
+		template <bool s, typename F>
+		typename std::enable_if<s>::type push(F&& func) {
+			do {
+				std::lock_guard<std::mutex> guard(storage.mutex);
+				storage.queue_buffer.push(std::forward<F>(func));
+			} while (false);
+
+			flush();
+		}
+
+		template <bool s, typename F>
+		typename std::enable_if<!s>::type push(F&& func) {
+			size_t thread_index = async_worker.get_current_thread_index();
+			std::vector<queue_buffer>& queue_buffers = storage.queue_buffers;
 			assert(thread_index < queue_buffers.size());
 			queue_buffer& buffer = queue_buffers[thread_index];
 			buffer.push(std::forward<F>(func));
@@ -426,6 +483,6 @@ namespace grid {
 		std::atomic<warp_t**> thread_warp; // save the running thread warp address.
 		std::atomic<size_t> suspend_count;
 		std::atomic<size_t> queueing; // is flush request sent to async_worker? 0 : not yet, 1 : yes, 2 : is to flush right away.
-		std::vector<queue_buffer> queue_buffers; // task queues, each thread send tasks to its own slot of queue_buffers.
+		storage_t<queue_buffer, strand> storage;
 	};
 }
