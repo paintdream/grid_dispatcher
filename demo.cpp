@@ -1,87 +1,6 @@
 #include "grid_dispatcher.h"
-#include <queue>
-#include <condition_variable>
 #include <iostream>
 using namespace grid;
-
-// here we code a trivial thread pool
-static thread_local size_t current_thread_index = ~(size_t)0;
-class demo_async_worker_t {
-public:
-	demo_async_worker_t(size_t thread_count) {
-		threads.reserve(thread_count);
-		terminated.store(0, std::memory_order_relaxed);
-		ready.store(0, std::memory_order_release);
-
-		std::cout << "starting thread pool. " << std::endl;
-		for (size_t i = 0; i < thread_count; i++) {
-			threads.emplace_back([this, i]() {
-				current_thread_index = i;
-
-				// fetch flush() requests from dispatcher_t
-				std::unique_lock<std::mutex> guard(mutex);
-				ready.fetch_add(1, std::memory_order_release);
-
-				while (terminated.load(std::memory_order_relaxed) == 0) {
-					condition.wait(guard);
-
-					while (!tasks.empty() && terminated.load(std::memory_order_relaxed) == 0) {
-						std::function<void()> func = std::move(tasks.front());
-						tasks.pop();
-
-						guard.unlock();
-						// execute flush
-						func();
-						guard.lock();
-					}
-				}
-			});
-		}
-
-		std::cout << "thread pool is created." << std::endl;
-	}
-
-	size_t get_current_thread_index() const { return current_thread_index; }
-	size_t get_thread_count() const {
-		return threads.size();
-	}
-
-	void queue(std::function<void()>&& func) {
-		do {
-			std::lock_guard<std::mutex> guard(mutex);
-			// std::cout << "enqueue a new task ..." << std::endl;
-			tasks.push(std::move(func));
-		} while (0);
-
-		condition.notify_one();
-	}
-
-	void wait_for_ready() {
-		std::cout << "wait thread starts..." << std::endl;
-		while (ready.load(std::memory_order_relaxed) == 0) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(50));
-		}
-	}
-
-	void terminate() {
-		terminated.store(1, std::memory_order_release);
-		condition.notify_all();
-	}
-
-	void join() {
-		for (size_t i = 0; i < threads.size(); i++) {
-			threads[i].join();
-		}
-	}
-
-protected:
-	std::vector<std::thread> threads; // thread pool
-	std::mutex mutex; // mutex for enqueue/dequeue task
-	std::queue<std::function<void()>> tasks; // thread task queue
-	std::atomic<size_t> terminated; // is to terminate
-	std::atomic<size_t> ready; // at least one thread is ready to accept tasks
-	std::condition_variable condition; // to notify new task
-};
 
 static void simple_explosion();
 static void garbage_collection();
@@ -103,7 +22,7 @@ void simple_explosion(void) {
 	std::vector<demo_warp_t> warps;
 	warps.reserve(warp_count);
 	for (size_t i = 0; i < warp_count; i++) {
-		warps.emplace_back(worker, thread_count);
+		warps.emplace_back(worker);
 	}
 
 	srand((unsigned int)time(nullptr));
@@ -154,7 +73,6 @@ void simple_explosion(void) {
 		}
 	};
 
-	worker.wait_for_ready();
 	// invoke explosion from external thread (current thread is external to the threads in thread pool)
 	warps[0].queue_routine_external(std::function<void()>(explosion));
 	worker.join();
@@ -175,7 +93,7 @@ void garbage_collection() {
 	std::vector<demo_warp_t> warps;
 	warps.reserve(warp_count);
 	for (size_t i = 0; i < warp_count; i++) {
-		warps.emplace_back(worker, thread_count);
+		warps.emplace_back(worker);
 	}
 
 	srand((unsigned int)time(nullptr));
@@ -218,7 +136,7 @@ void garbage_collection() {
 	// ok now let's start collect from root!
 	std::function<void(size_t)> collector;
 	std::atomic<size_t> collecting_count;
-	collecting_count.store(0, std::memory_order_relaxed);
+	collecting_count.store(0, std::memory_order_release);
 
 	collector = [&warps, &collector, &worker, &graph, &collecting_count](size_t node_index) {
 		demo_warp_t& current_warp = demo_warp_t::get_current_warp();
@@ -253,7 +171,6 @@ void garbage_collection() {
 		}
 	};
 
-	worker.wait_for_ready();
 	// invoke explosion from external thread (current thread is external to the threads in thread pool)
 	collecting_count.fetch_add(1, std::memory_order_acquire);
 	// add more references to root

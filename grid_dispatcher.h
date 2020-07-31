@@ -34,8 +34,9 @@ SOFTWARE.
 #include <thread>
 #include <vector>
 #include <atomic>
-#include <mutex>
 #include <cassert>
+#include <mutex>
+#include <condition_variable>
 
 namespace grid {
 	// simple kfifo like queue. allowing one-thread read (pop) and one-thread write (push).
@@ -65,26 +66,27 @@ namespace grid {
 		}
 
 		T& top() {
-			std::atomic_thread_fence(std::memory_order_acquire);
 			assert(!empty());
 			return ring_buffer[pop_index];
 		}
 
 		const T& top() const {
-			std::atomic_thread_fence(std::memory_order_acquire);
 			assert(!empty());
 			return ring_buffer[pop_index];
 		}
 
 		void pop() {
+			std::atomic_thread_fence(std::memory_order_acquire);
 			pop_index = (pop_index + 1) & MASK;
 		}
 
 		bool empty() const {
+			std::atomic_thread_fence(std::memory_order_acquire);
 			return pop_index == push_index;
 		}
 
 		size_t count() const {
+			std::atomic_thread_fence(std::memory_order_acquire);
 			return (pop_index + MASK - push_index) % MASK;
 		}
 
@@ -169,7 +171,8 @@ namespace grid {
 			if (pop_head->empty() && pop_head != push_head) {
 				node* p = pop_head;
 				pop_head = pop_head->next;
-				std::atomic_thread_fence(std::memory_order_release);
+				// no need to do this
+				// std::atomic_thread_fence(std::memory_order_release);
 				delete p;
 			}
 		}
@@ -220,7 +223,7 @@ namespace grid {
 	//     3. from warp to external in parallel (queue_routine_parallel).
 	// you can select implemention from warp/strand via 'strand' template parameter.
 	template <typename async_worker_t, bool strand = false, size_t K = 6>
-	class warp_t {
+	class alignas(64) warp_t {
 	public:
 		using queue_buffer = queue_list_t<std::function<void()>, K>;
 
@@ -235,8 +238,8 @@ namespace grid {
 			storage.queue_buffers.resize(thread_count);
 		}
 
-		warp_t(async_worker_t& worker, size_t thread_count) : async_worker(worker) {
-			init_buffers<strand>(thread_count);
+		warp_t(async_worker_t& worker) : async_worker(worker) {
+			init_buffers<strand>(worker.get_thread_count());
 
 			thread_warp.store(nullptr, std::memory_order_relaxed);
 			suspend_count.store(0, std::memory_order_relaxed);
@@ -257,7 +260,7 @@ namespace grid {
 		// take execution atomically, returns true on success.
 		bool preempt() {
 			warp_t** expected = nullptr;
-			if (thread_warp.compare_exchange_strong(expected, &get_current_warp_internal(), std::memory_order_acq_rel)) {
+			if (thread_warp.compare_exchange_strong(expected, &get_current_warp_internal(), std::memory_order_acquire)) {
 				get_current_warp_internal() = this;
 				return true;
 			} else {
@@ -394,9 +397,10 @@ namespace grid {
 				if (preempt()) {
 					// mark for queueing, avoiding flush me more than once.
 					queueing.store(2, std::memory_order_relaxed);
+
 					queue_buffer& buffer = storage.queue_buffer;
 					while (!buffer.empty()) {
-						buffer.top()();
+						buffer.top()(); // we have already thread_fence acquired above
 						buffer.pop();
 
 						if (suspend_count.load(std::memory_order_acquire) != 0
@@ -451,7 +455,7 @@ namespace grid {
 
 		// commit execute request to specified thread pool.
 		void flush() {
-			if (queueing.exchange(1, std::memory_order_relaxed) == 0) {
+			if (queueing.exchange(1, std::memory_order_acq_rel) == 0) {
 				async_worker.queue(std::bind(&warp_t::template execute<strand>, this));
 			}
 		}
@@ -484,5 +488,96 @@ namespace grid {
 		std::atomic<size_t> suspend_count;
 		std::atomic<size_t> queueing; // is flush request sent to async_worker? 0 : not yet, 1 : yes, 2 : is to flush right away.
 		storage_t<queue_buffer, strand> storage;
+	};
+
+	// here we code a trivial thread pool demo
+	// could be replaced by your implementation
+	static thread_local size_t current_thread_index = ~(size_t)0;
+	class demo_async_worker_t {
+	public:
+		demo_async_worker_t(size_t thread_count) {
+			waiting_count = 0;
+			threads.reserve(thread_count);
+			terminated.store(0, std::memory_order_relaxed);
+			task_head.store(nullptr, std::memory_order_release);
+
+			// std::cout << "starting thread pool. " << std::endl;
+			for (size_t i = 0; i < thread_count; i++) {
+				threads.emplace_back([this, i]() {
+					current_thread_index = i;
+
+					while (terminated.load(std::memory_order_acquire) == 0) {
+						if (task_head.load(std::memory_order_acquire) != nullptr) {
+							task_t* task = task_head.exchange(nullptr, std::memory_order_acquire);
+							if (task != nullptr) {
+								task_t* org = task_head.exchange(task->next, std::memory_order_release);
+								while (org != nullptr) {
+									task_t* next = org->next;
+									org->next = task_head.load(std::memory_order_acquire);
+									while (!task_head.compare_exchange_weak(org->next, org, std::memory_order_release)) {
+										std::this_thread::yield();
+									}
+
+									org = next;
+								}
+
+								task->task();
+								delete task;
+							}
+						} else {
+							std::unique_lock<std::mutex> lock(mutex);
+							++waiting_count;
+							condition.wait_for(lock, std::chrono::milliseconds(50));
+							--waiting_count;
+						}
+					}
+				});
+			}
+
+			// std::cout << "thread pool is created." << std::endl;
+		}
+
+		size_t get_current_thread_index() const { return current_thread_index; }
+		size_t get_thread_count() const {
+			return threads.size();
+		}
+
+		void queue(std::function<void()>&& func) {
+			task_t* task = new task_t(std::move(func), task_head.load(std::memory_order_acquire));
+
+			while (!task_head.compare_exchange_weak(task->next, task, std::memory_order_release)) {
+				std::this_thread::yield();
+			}
+
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (waiting_count != 0) {
+				condition.notify_one();
+			}
+		}
+
+		void terminate() {
+			terminated.store(1, std::memory_order_release);
+		}
+
+		void join() {
+			for (size_t i = 0; i < threads.size(); i++) {
+				threads[i].join();
+			}
+		}
+
+	protected:
+		struct task_t {
+			task_t(std::function<void()>&& func, task_t* n) : task(std::move(func)), next(n) {}
+
+			std::function<void()> task;
+			task_t* next;
+		};
+
+		std::vector<std::thread> threads; // thread pool
+		std::mutex mutex; // mutex to protect condition
+		std::condition_variable condition; // condition variable for idle wait
+		std::atomic<task_t*> task_head; // task list
+		std::atomic<size_t> terminated; // is to terminate
+		size_t waiting_count; // thread count of waiting on condition variable
 	};
 }
