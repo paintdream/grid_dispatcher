@@ -385,6 +385,7 @@ namespace grid {
 
 	protected:
 		// get current warp index (saved in thread_local storage)
+		// be aware of multi-dll linkage!
 		static warp_t*& get_current_warp_internal() {
 			static thread_local warp_t* current_warp = nullptr;
 			return current_warp;
@@ -492,7 +493,6 @@ namespace grid {
 
 	// here we code a trivial thread pool demo
 	// could be replaced by your implementation
-	static thread_local size_t current_thread_index = ~(size_t)0;
 	class demo_async_worker_t {
 	public:
 		demo_async_worker_t(size_t thread_count) {
@@ -504,7 +504,7 @@ namespace grid {
 			// std::cout << "starting thread pool. " << std::endl;
 			for (size_t i = 0; i < thread_count; i++) {
 				threads.emplace_back([this, i]() {
-					current_thread_index = i;
+					get_current_thread_index_internal() = i;
 
 					while (terminated.load(std::memory_order_acquire) == 0) {
 						if (task_head.load(std::memory_order_acquire) != nullptr) {
@@ -537,7 +537,7 @@ namespace grid {
 			// std::cout << "thread pool is created." << std::endl;
 		}
 
-		size_t get_current_thread_index() const { return current_thread_index; }
+		size_t get_current_thread_index() const { return get_current_thread_index_internal(); }
 		size_t get_thread_count() const {
 			return threads.size();
 		}
@@ -566,6 +566,12 @@ namespace grid {
 		}
 
 	protected:
+		// be aware of multi-dll linkage!
+		static size_t& get_current_thread_index_internal() {
+			static thread_local size_t current_thread_index = ~(size_t)0;
+			return current_thread_index;
+		}
+
 		struct task_t {
 			task_t(std::function<void()>&& func, task_t* n) : task(std::move(func)), next(n) {}
 
