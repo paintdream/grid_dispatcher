@@ -537,14 +537,21 @@ namespace grid {
 			// std::cout << "thread pool is created." << std::endl;
 		}
 
+		~demo_async_worker_t() {
+			terminate();
+			join();
+		}
+
 		size_t get_current_thread_index() const { return get_current_thread_index_internal(); }
 		size_t get_thread_count() const {
 			return threads.size();
 		}
 
 		void queue(std::function<void()>&& func) {
-			task_t* task = new task_t(std::move(func), task_head.load(std::memory_order_acquire));
+			if (terminated.load(std::memory_order_acquire) != 0)
+				return;
 
+			task_t* task = new task_t(std::move(func), task_head.load(std::memory_order_acquire));
 			while (!task_head.compare_exchange_weak(task->next, task, std::memory_order_release)) {
 				std::this_thread::yield();
 			}
@@ -563,9 +570,21 @@ namespace grid {
 			for (size_t i = 0; i < threads.size(); i++) {
 				threads[i].join();
 			}
+
+			threads.clear();
+			clean();
 		}
 
 	protected:
+		void clean() {
+			task_t* task = task_head.exchange(nullptr, std::memory_order_acquire);
+			while (task != nullptr) {
+				task_t* p = task;
+				task = task->next;
+				delete p;
+			}
+		}
+
 		// be aware of multi-dll linkage!
 		static size_t& get_current_thread_index_internal() {
 			static thread_local size_t current_thread_index = ~(size_t)0;
