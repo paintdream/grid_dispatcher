@@ -501,30 +501,12 @@ namespace grid {
 			terminated.store(0, std::memory_order_relaxed);
 			task_head.store(nullptr, std::memory_order_release);
 
-			// std::cout << "starting thread pool. " << std::endl;
 			for (size_t i = 0; i < thread_count; i++) {
 				threads.emplace_back([this, i]() {
+					get_current() = this;
 					get_current_thread_index_internal() = i;
-
 					while (terminated.load(std::memory_order_acquire) == 0) {
-						if (task_head.load(std::memory_order_acquire) != nullptr) {
-							task_t* task = task_head.exchange(nullptr, std::memory_order_acquire);
-							if (task != nullptr) {
-								task_t* org = task_head.exchange(task->next, std::memory_order_release);
-								while (org != nullptr) {
-									task_t* next = org->next;
-									org->next = task_head.load(std::memory_order_acquire);
-									while (!task_head.compare_exchange_weak(org->next, org, std::memory_order_release)) {
-										std::this_thread::yield();
-									}
-
-									org = next;
-								}
-
-								task->task();
-								delete task;
-							}
-						} else {
+						if (!poll()) {
 							std::unique_lock<std::mutex> lock(mutex);
 							++waiting_count;
 							condition.wait_for(lock, std::chrono::milliseconds(50));
@@ -533,8 +515,31 @@ namespace grid {
 					}
 				});
 			}
+		}
 
-			// std::cout << "thread pool is created." << std::endl;
+		bool poll() {
+			if (task_head.load(std::memory_order_acquire) != nullptr) {
+				task_t* task = task_head.exchange(nullptr, std::memory_order_acquire);
+				if (task != nullptr) {
+					task_t* org = task_head.exchange(task->next, std::memory_order_release);
+					while (org != nullptr) {
+						task_t* next = org->next;
+						org->next = task_head.load(std::memory_order_acquire);
+						while (!task_head.compare_exchange_weak(org->next, org, std::memory_order_release)) {
+							std::this_thread::yield();
+						}
+
+						org = next;
+					}
+
+					task->task();
+					delete task;
+
+					return true;
+				}
+			}
+
+			return false;
 		}
 
 		~demo_async_worker_t() {
@@ -566,6 +571,10 @@ namespace grid {
 			terminated.store(1, std::memory_order_release);
 		}
 
+		bool is_terminated() const {
+			return terminated.load(std::memory_order_acquire);
+		}
+
 		void join() {
 			for (size_t i = 0; i < threads.size(); i++) {
 				threads[i].join();
@@ -573,6 +582,12 @@ namespace grid {
 
 			threads.clear();
 			clean();
+		}
+
+		// be aware of multi-dll linkage!
+		static demo_async_worker_t*& get_current() {
+			static thread_local demo_async_worker_t* current_async_worker = nullptr;
+			return current_async_worker;
 		}
 
 	protected:
