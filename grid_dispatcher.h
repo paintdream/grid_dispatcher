@@ -50,7 +50,7 @@ namespace grid {
 		static constexpr size_t MASK = N - 1;
 
 		template <class D>
-		bool push(D&& t) {
+		bool push(D&& t) noexcept {
 			size_t next_index = (push_index + 1) & MASK;
 			if (next_index == pop_index) {
 				return false; // this queue is full, push failed
@@ -65,27 +65,27 @@ namespace grid {
 			return true;
 		}
 
-		T& top() {
+		T& top() noexcept {
 			assert(!empty());
 			return ring_buffer[pop_index];
 		}
 
-		const T& top() const {
+		const T& top() const noexcept {
 			assert(!empty());
 			return ring_buffer[pop_index];
 		}
 
-		void pop() {
+		void pop() noexcept {
 			std::atomic_thread_fence(std::memory_order_acquire);
 			pop_index = (pop_index + 1) & MASK;
 		}
 
-		bool empty() const {
+		bool empty() const noexcept {
 			std::atomic_thread_fence(std::memory_order_acquire);
 			return pop_index == push_index;
 		}
 
-		size_t count() const {
+		size_t count() const noexcept {
 			std::atomic_thread_fence(std::memory_order_acquire);
 			return (pop_index + MASK - push_index) % MASK;
 		}
@@ -112,7 +112,7 @@ namespace grid {
 		queue_list_t(const queue_list_t& rhs) = delete;
 		queue_list_t& operator = (const queue_list_t& rhs) = delete;
 
-		queue_list_t() {
+		queue_list_t() noexcept(noexcept(new node())) {
 			push_head = pop_head = new node();
 		}
 
@@ -124,7 +124,7 @@ namespace grid {
 			rhs.pop_head = nullptr;
 		}
 
-		queue_list_t& operator = (queue_list_t&& rhs) {
+		queue_list_t& operator = (queue_list_t&& rhs) noexcept {
 			// just swap pointers.
 			std::swap(push_head, rhs.push_head);
 			std::swap(pop_head, rhs.pop_head);
@@ -144,7 +144,7 @@ namespace grid {
 		}
 
 		template <class D>
-		void push(D&& t) {
+		void push(D&& t) noexcept(noexcept(new node())) {
 			if (!push_head->push(std::forward<D>(t))) { // sub queue full?
 				node* p = new node(); // allocate new node.
 				p->push(std::forward<D>(t)); // must success.
@@ -156,15 +156,15 @@ namespace grid {
 			}
 		}
 
-		T& top() {
+		T& top() noexcept {
 			return pop_head->top();
 		}
 
-		const T& top() const {
+		const T& top() const noexcept {
 			return pop_head->top();
 		}
 
-		void pop() {
+		void pop() noexcept {
 			pop_head->pop();
 
 			// current queue is empty, remove it from list.
@@ -177,11 +177,11 @@ namespace grid {
 			}
 		}
 
-		bool empty() const {
+		bool empty() const noexcept {
 			return pop_head->empty();
 		}
 
-		size_t count() const {
+		size_t count() const noexcept {
 			size_t counter = 0;
 			// sum up all sub queues
 			for (node* p = pop_head; p != nullptr; p = p->next) {
@@ -198,7 +198,7 @@ namespace grid {
 
 	template <typename queue_buffer_t, bool>
 	struct storage_t {
-		storage_t() {}
+		storage_t() noexcept {}
 		storage_t(storage_t&& rhs) noexcept {
 			queue_buffer = std::move(rhs.queue_buffer);
 		}
@@ -225,16 +225,17 @@ namespace grid {
 	template <typename async_worker_t, bool strand = false, size_t K = 6>
 	class alignas(64) warp_t {
 	public:
-		using queue_buffer = queue_list_t<std::function<void()>, K>;
+		using queue_buffer = queue_list_t<std::function<void() noexcept>, K>;
 
 		// do not copy this class, only to move
 		warp_t(const warp_t& rhs) = delete;
 		warp_t& operator = (const warp_t& rhs) = delete;
+		warp_t& operator = (warp_t&& rhs) = delete;
 
 		template <bool s>
-		typename std::enable_if<s>::type init_buffers(size_t thread_count) {}
+		typename std::enable_if<s>::type init_buffers(size_t thread_count) noexcept {}
 		template <bool s>
-		typename std::enable_if<!s>::type init_buffers(size_t thread_count) {
+		typename std::enable_if<!s>::type init_buffers(size_t thread_count) noexcept(noexcept(std::declval<warp_t>().storage.queue_buffers.resize(thread_count))) {
 			storage.queue_buffers.resize(thread_count);
 		}
 
@@ -258,7 +259,7 @@ namespace grid {
 		}
 
 		// take execution atomically, returns true on success.
-		bool preempt() {
+		bool preempt() noexcept {
 			warp_t** expected = nullptr;
 			if (thread_warp.compare_exchange_strong(expected, &get_current_warp_internal(), std::memory_order_acquire)) {
 				get_current_warp_internal() = this;
@@ -269,7 +270,7 @@ namespace grid {
 		}
 
 		// yield execution atomically, returns true on success.
-		bool yield() {
+		bool yield() noexcept(noexcept(std::declval<warp_t>().flush())) {
 			warp_t** exp = &get_current_warp_internal();
 			if (thread_warp.compare_exchange_strong(exp, nullptr, std::memory_order_release)) {
 				get_current_warp_internal() = nullptr;
@@ -284,13 +285,13 @@ namespace grid {
 		}
 
 		// blocks all tasks preemptions, stacked with internally counting.
-		void suspend() {
+		void suspend() noexcept {
 			suspend_count.fetch_add(1, std::memory_order_acquire);
 		}
 
 		// allows all tasks preemptions, stacked with internally counting.
 		// returns true on final resume.
-		bool resume() {
+		bool resume() noexcept(noexcept(std::declval<warp_t>().flush())) {
 			bool ret = suspend_count.fetch_sub(1, std::memory_order_release) == 1;
 
 			if (ret) {
@@ -377,7 +378,7 @@ namespace grid {
 			}
 		}
 
-		static warp_t& get_current_warp() {
+		static warp_t& get_current_warp() noexcept {
 			warp_t* ptr = get_current_warp_internal();
 			assert(ptr != nullptr);
 			return *ptr;
@@ -386,14 +387,14 @@ namespace grid {
 	protected:
 		// get current warp index (saved in thread_local storage)
 		// be aware of multi-dll linkage!
-		static warp_t*& get_current_warp_internal() {
+		static warp_t*& get_current_warp_internal() noexcept {
 			static thread_local warp_t* current_warp = nullptr;
 			return current_warp;
 		}
 
 		// execute all tasks scheduled at once.
 		template <bool s>
-		typename std::enable_if<s>::type execute() {
+		typename std::enable_if<s>::type execute() noexcept(noexcept(std::declval<warp_t>().flush())) {
 			if (suspend_count.load(std::memory_order_acquire) == 0) {
 				if (preempt()) {
 					// mark for queueing, avoiding flush me more than once.
@@ -420,7 +421,7 @@ namespace grid {
 		}
 
 		template <bool s>
-		typename std::enable_if<!s>::type execute() {
+		typename std::enable_if<!s>::type execute() noexcept(noexcept(std::declval<warp_t>().flush())) {
 			if (suspend_count.load(std::memory_order_acquire) == 0) {
 				// try to acquire execution, if it fails, there must be another thread doing the same thing
 				// and it's ok to return immediatly.
@@ -455,7 +456,7 @@ namespace grid {
 		}
 
 		// commit execute request to specified thread pool.
-		void flush() {
+		void flush() noexcept(noexcept(std::declval<warp_t>().async_worker.queue(std::function<void() noexcept>()))) {
 			if (queueing.exchange(1, std::memory_order_acq_rel) == 0) {
 				async_worker.queue(std::bind(&warp_t::template execute<strand>, this));
 			}
@@ -503,15 +504,19 @@ namespace grid {
 
 			for (size_t i = 0; i < thread_count; i++) {
 				threads.emplace_back([this, i]() {
-					get_current() = this;
-					get_current_thread_index_internal() = i;
-					while (terminated.load(std::memory_order_acquire) == 0) {
-						if (!poll()) {
-							std::unique_lock<std::mutex> lock(mutex);
-							++waiting_count;
-							condition.wait_for(lock, std::chrono::milliseconds(50));
-							--waiting_count;
+					try {
+						get_current() = this;
+						get_current_thread_index_internal() = i;
+						while (terminated.load(std::memory_order_acquire) == 0) {
+							if (!poll()) {
+								std::unique_lock<std::mutex> lock(mutex);
+								++waiting_count;
+								condition.wait_for(lock, std::chrono::milliseconds(50));
+								--waiting_count;
+							}
 						}
+					} catch (std::bad_alloc&) {
+						throw; // by default, terminate
 					}
 				});
 			}
@@ -547,8 +552,8 @@ namespace grid {
 			join();
 		}
 
-		size_t get_current_thread_index() const { return get_current_thread_index_internal(); }
-		size_t get_thread_count() const {
+		size_t get_current_thread_index() const noexcept { return get_current_thread_index_internal(); }
+		size_t get_thread_count() const noexcept {
 			return threads.size();
 		}
 
@@ -567,11 +572,11 @@ namespace grid {
 			}
 		}
 
-		void terminate() {
+		void terminate() noexcept {
 			terminated.store(1, std::memory_order_release);
 		}
 
-		bool is_terminated() const {
+		bool is_terminated() const noexcept {
 			return terminated.load(std::memory_order_acquire);
 		}
 
@@ -585,13 +590,13 @@ namespace grid {
 		}
 
 		// be aware of multi-dll linkage!
-		static demo_async_worker_t*& get_current() {
+		static demo_async_worker_t*& get_current() noexcept {
 			static thread_local demo_async_worker_t* current_async_worker = nullptr;
 			return current_async_worker;
 		}
 
 	protected:
-		void clean() {
+		void clean() noexcept {
 			task_t* task = task_head.exchange(nullptr, std::memory_order_acquire);
 			while (task != nullptr) {
 				task_t* p = task;
@@ -601,13 +606,18 @@ namespace grid {
 		}
 
 		// be aware of multi-dll linkage!
-		static size_t& get_current_thread_index_internal() {
+		static size_t& get_current_thread_index_internal() noexcept {
 			static thread_local size_t current_thread_index = ~(size_t)0;
 			return current_thread_index;
 		}
 
 		struct task_t {
-			task_t(std::function<void()>&& func, task_t* n) : task(std::move(func)), next(n) {}
+			task_t(std::function<void()>&& func, task_t* n) noexcept : task(std::move(func)), next(n) {}
+			task_t(task_t&& rhs) noexcept {
+				task = std::move(rhs.task);
+				next = rhs.next;
+				rhs.next = nullptr;
+			}
 
 			std::function<void()> task;
 			task_t* next;

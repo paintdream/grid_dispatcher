@@ -34,10 +34,10 @@ void simple_explosion(void) {
 	static size_t parallel_factor = 11;
 	static size_t parallel_count = 6;
 
-	std::function<void()> explosion;
+	std::function<void() noexcept> explosion;
 
 	// queue tasks randomly to test if dispatcher could handle them correctly.
-	explosion = [&warps, &explosion, &worker]() {
+	explosion = [&warps, &explosion, &worker]() noexcept {
 		demo_warp_t& current_warp = demo_warp_t::get_current_warp();
 		size_t warp_index = &current_warp - &warps[0];
 		warp_data[warp_index]++;
@@ -54,7 +54,7 @@ void simple_explosion(void) {
 		warp_data[warp_index]++;
 		// randomly dispatch to warp
 		for (size_t i = 0; i < split_count; i++) {
-			warps[rand() % warp_count].queue_routine(std::function<void()>(explosion));
+			warps[rand() % warp_count].queue_routine(std::function<void() noexcept>(explosion));
 		}
 
 		warp_data[warp_index] -= 3;
@@ -134,11 +134,11 @@ void garbage_collection() {
 	size_t root_index = rand() % node_count;
 
 	// ok now let's start collect from root!
-	std::function<void(size_t)> collector;
+	std::function<void(size_t) noexcept> collector;
 	std::atomic<size_t> collecting_count;
 	collecting_count.store(0, std::memory_order_release);
 
-	collector = [&warps, &collector, &worker, &graph, &collecting_count](size_t node_index) {
+	collector = [&warps, &collector, &worker, &graph, &collecting_count](size_t node_index) noexcept {
 		demo_warp_t& current_warp = demo_warp_t::get_current_warp();
 		size_t warp_index = &current_warp - &warps[0];
 
