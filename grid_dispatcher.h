@@ -513,9 +513,33 @@ namespace grid {
 
 	// here we code a trivial thread pool demo
 	// could be replaced by your implementation
+
+	// task wrapper
+	template <typename callback_t>
+	struct alignas(64) demo_task_t {
+		demo_task_t(callback_t&& func, demo_task_t* n) noexcept : task(std::move(func)), next(n) {}
+
+		demo_task_t(demo_task_t&& rhs) noexcept {
+			task = std::move(rhs.task);
+			next = rhs.next;
+			rhs.next = nullptr;
+		}
+
+		demo_task_t& operator = (demo_task_t&& rhs) noexcept {
+			task = std::move(rhs.task);
+			next = rhs.next;
+			rhs.next = nullptr;
+		}
+
+		callback_t task;
+		demo_task_t* next;
+	};
+
+	// thread pool
+	template <typename callback_t = std::function<void()>, typename task_allocator_t = std::allocator<demo_task_t<callback_t>>>
 	class demo_async_worker_t {
 	public:
-		demo_async_worker_t(size_t thread_count) {
+		demo_async_worker_t(size_t thread_count, const task_allocator_t& alloc = task_allocator_t()) : task_allocator(alloc) {
 			waiting_count = 0;
 			threads.reserve(thread_count);
 			terminated.store(0, std::memory_order_relaxed);
@@ -547,11 +571,11 @@ namespace grid {
 
 		bool poll() {
 			if (task_head.load(std::memory_order_acquire) != nullptr) {
-				task_t* task = task_head.exchange(nullptr, std::memory_order_acquire);
+				demo_task_t<callback_t>* task = task_head.exchange(nullptr, std::memory_order_acquire);
 				if (task != nullptr) {
-					task_t* org = task_head.exchange(task->next, std::memory_order_release);
+					demo_task_t<callback_t>* org = task_head.exchange(task->next, std::memory_order_release);
 					while (org != nullptr) {
-						task_t* next = org->next;
+						demo_task_t<callback_t>* next = org->next;
 						org->next = task_head.load(std::memory_order_acquire);
 						while (!task_head.compare_exchange_weak(org->next, org, std::memory_order_release)) {
 							std::this_thread::yield();
@@ -561,7 +585,8 @@ namespace grid {
 					}
 
 					task->task();
-					delete task;
+					task_allocator.destroy(task);
+					task_allocator.deallocate(task, 1);
 
 					return true;
 				}
@@ -580,11 +605,13 @@ namespace grid {
 			return threads.size();
 		}
 
-		void queue(std::function<void()>&& func) {
+		void queue(callback_t&& func) {
 			if (terminated.load(std::memory_order_acquire) != 0)
 				return;
 
-			task_t* task = new task_t(std::move(func), task_head.load(std::memory_order_acquire));
+			demo_task_t<callback_t>* task = task_allocator.allocate(1);
+			task_allocator.construct(task, std::move(func), task_head.load(std::memory_order_acquire));
+
 			while (!task_head.compare_exchange_weak(task->next, task, std::memory_order_release)) {
 				std::this_thread::yield();
 			}
@@ -620,11 +647,13 @@ namespace grid {
 
 	protected:
 		void clean() noexcept {
-			task_t* task = task_head.exchange(nullptr, std::memory_order_acquire);
+			demo_task_t<callback_t>* task = task_head.exchange(nullptr, std::memory_order_acquire);
 			while (task != nullptr) {
-				task_t* p = task;
+				demo_task_t<callback_t>* p = task;
 				task = task->next;
-				delete p;
+
+				task_allocator.destroy(p);
+				task_allocator.deallocate(p, 1);
 			}
 		}
 
@@ -634,29 +663,11 @@ namespace grid {
 			return current_thread_index;
 		}
 
-		struct task_t {
-			task_t(std::function<void()>&& func, task_t* n) noexcept : task(std::move(func)), next(n) {}
-
-			task_t(task_t&& rhs) noexcept {
-				task = std::move(rhs.task);
-				next = rhs.next;
-				rhs.next = nullptr;
-			}
-
-			task_t& operator = (task_t&& rhs) noexcept {
-				task = std::move(rhs.task);
-				next = rhs.next;
-				rhs.next = nullptr;
-			}
-
-			std::function<void()> task;
-			task_t* next;
-		};
-
+		task_allocator_t task_allocator;
 		std::vector<std::thread> threads; // thread pool
 		std::mutex mutex; // mutex to protect condition
 		std::condition_variable condition; // condition variable for idle wait
-		std::atomic<task_t*> task_head; // task list
+		std::atomic<demo_task_t<callback_t>*> task_head; // task list
 		std::atomic<size_t> terminated; // is to terminate
 		size_t waiting_count; // thread count of waiting on condition variable
 	};

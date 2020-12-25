@@ -12,13 +12,13 @@ int main(void) {
 	return 0;
 }
 
-typedef warp_t<demo_async_worker_t> demo_warp_t;
+typedef warp_t<demo_async_worker_t<>> demo_warp_t;
 
 void simple_explosion(void) {
 	static const size_t thread_count = 4;
 	static const size_t warp_count = 8;
 
-	demo_async_worker_t worker(thread_count);
+	demo_async_worker_t<> worker(thread_count);
 	std::vector<demo_warp_t> warps;
 	warps.reserve(warp_count);
 	for (size_t i = 0; i < warp_count; i++) {
@@ -89,7 +89,7 @@ void simple_explosion(void) {
 void garbage_collection() {
 	static const size_t thread_count = 8;
 	static const size_t warp_count = 16;
-	demo_async_worker_t worker(thread_count);
+	demo_async_worker_t<> worker(thread_count);
 	std::vector<demo_warp_t> warps;
 	warps.reserve(warp_count);
 	for (size_t i = 0; i < warp_count; i++) {
