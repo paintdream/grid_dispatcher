@@ -171,13 +171,13 @@ void garbage_collection() {
 		}
 	};
 
-	// invoke explosion from external thread (current thread is external to the threads in thread pool)
 	collecting_count.fetch_add(1, std::memory_order_acquire);
 	// add more references to root
 	for (size_t j = 0; j < extra_node_connection_root; j++) {
 		graph.nodes[root_index].references.emplace_back(rand() % node_count);
 	}
 
+	// invoke explosion from external thread (current thread is external to the threads in thread pool)
 	warps[graph.nodes[root_index].warp_index].queue_routine_external(std::bind(collector, root_index));
 	worker.join();
 

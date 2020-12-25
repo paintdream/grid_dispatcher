@@ -225,7 +225,7 @@ namespace grid {
 	template <typename async_worker_t, bool strand = false, size_t K = 6>
 	class alignas(64) warp_t {
 	public:
-		using queue_buffer = queue_list_t<std::function<void() noexcept>, K>;
+		using queue_buffer = queue_list_t<std::function<void()>, K>;
 
 		// do not copy this class, only to move
 		warp_t(const warp_t& rhs) = delete;
@@ -267,6 +267,25 @@ namespace grid {
 			} else {
 				return get_current_warp_internal() == this;
 			}
+		}
+
+		// poll until preempt
+		bool preempt_poll() {
+			size_t try_count = 0;
+			while (!preempt()) {
+				if (async_worker.is_terminated()) {
+					return false;
+				}
+
+				if (!async_worker.poll()) {
+					async_worker.delay(try_count >> 4);
+					try_count = 0;
+				} else {
+					try_count++;
+				}
+			}
+
+			return true;
 		}
 
 		// yield execution atomically, returns true on success.
@@ -456,7 +475,7 @@ namespace grid {
 		}
 
 		// commit execute request to specified thread pool.
-		void flush() noexcept(noexcept(std::declval<warp_t>().async_worker.queue(std::function<void() noexcept>()))) {
+		void flush() noexcept(noexcept(std::declval<warp_t>().async_worker.queue(std::function<void()>()))) {
 			if (queueing.exchange(1, std::memory_order_acq_rel) == 0) {
 				async_worker.queue(std::bind(&warp_t::template execute<strand>, this));
 			}
@@ -509,10 +528,7 @@ namespace grid {
 						get_current_thread_index_internal() = i;
 						while (terminated.load(std::memory_order_acquire) == 0) {
 							if (!poll()) {
-								std::unique_lock<std::mutex> lock(mutex);
-								++waiting_count;
-								condition.wait_for(lock, std::chrono::milliseconds(50));
-								--waiting_count;
+								delay(50);
 							}
 						}
 					} catch (std::bad_alloc&) {
@@ -520,6 +536,13 @@ namespace grid {
 					}
 				});
 			}
+		}
+
+		void delay(size_t millseconds) {
+			std::unique_lock<std::mutex> lock(mutex);
+			++waiting_count;
+			condition.wait_for(lock, std::chrono::milliseconds(millseconds));
+			--waiting_count;
 		}
 
 		bool poll() {
@@ -613,7 +636,14 @@ namespace grid {
 
 		struct task_t {
 			task_t(std::function<void()>&& func, task_t* n) noexcept : task(std::move(func)), next(n) {}
+
 			task_t(task_t&& rhs) noexcept {
+				task = std::move(rhs.task);
+				next = rhs.next;
+				rhs.next = nullptr;
+			}
+
+			task_t& operator = (task_t&& rhs) noexcept {
 				task = std::move(rhs.task);
 				next = rhs.next;
 				rhs.next = nullptr;
