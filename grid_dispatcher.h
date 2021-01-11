@@ -577,9 +577,7 @@ namespace grid {
 					while (org != nullptr) {
 						demo_task_t<callback_t>* next = org->next;
 						org->next = task_head.load(std::memory_order_acquire);
-						while (!task_head.compare_exchange_weak(org->next, org, std::memory_order_release)) {
-							std::this_thread::yield();
-						}
+						while (!task_head.compare_exchange_weak(org->next, org, std::memory_order_release)) {}
 
 						org = next;
 					}
@@ -612,9 +610,7 @@ namespace grid {
 			demo_task_t<callback_t>* task = task_allocator.allocate(1);
 			task_allocator.construct(task, std::move(func), task_head.load(std::memory_order_acquire));
 
-			while (!task_head.compare_exchange_weak(task->next, task, std::memory_order_release)) {
-				std::this_thread::yield();
-			}
+			while (!task_head.compare_exchange_weak(task->next, task, std::memory_order_release)) {}
 
 			std::atomic_thread_fence(std::memory_order_acquire);
 			if (waiting_count != 0) {
